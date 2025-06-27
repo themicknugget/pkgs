@@ -83,11 +83,11 @@ jobs:
       - name: Push to registry
         if: github.event_name != 'pull_request'
         run: |
-          make  PUSH=true
+          make PUSH=true USERNAME=${{ github.repository_owner }} REGISTRY=ghcr.io
       - name: Push nonfree
         if: github.event_name != 'pull_request'
         run: |
-          make nonfree PUSH=true
+          make nonfree PUSH=true USERNAME=${{ github.repository_owner }} REGISTRY=ghcr.io
       - name: Retrieve PR labels
         id: retrieve-pr-labels
         uses: actions/github-script@v7
