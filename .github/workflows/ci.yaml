@@ -25,9 +25,7 @@ jobs:
       issues: read
       packages: write
       pull-requests: read
-    runs-on:
-      - self-hosted
-      - pkgs
+    runs-on: ubuntu-latest
     if: (!startsWith(github.head_ref, 'renovate/') && !startsWith(github.head_ref, 'dependabot/'))
     outputs:
       labels: ${{ steps.retrieve-pr-labels.outputs.result }}
@@ -66,11 +64,7 @@ jobs:
         id: setup-buildx
         uses: docker/setup-buildx-action@v3
         with:
-          append: |
-            - endpoint: tcp://buildkit-arm64.ci.svc.cluster.local:1234
-              platforms: linux/arm64
-          driver: remote
-          endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234
+          platforms: linux/amd64,linux/arm64
       - name: Build
         if: github.event_name == 'pull_request'
         run: |
@@ -120,9 +114,7 @@ jobs:
           body_path: _out/RELEASE_NOTES.md
           draft: "true"
   reproducibility:
-    runs-on:
-      - self-hosted
-      - pkgs
+    runs-on: ubuntu-latest
     if: contains(fromJSON(needs.default.outputs.labels), 'integration/reproducibility')
     needs:
       - default
@@ -161,11 +153,7 @@ jobs:
         id: setup-buildx
         uses: docker/setup-buildx-action@v3
         with:
-          append: |
-            - endpoint: tcp://buildkit-arm64.ci.svc.cluster.local:1234
-              platforms: linux/arm64
-          driver: remote
-          endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234
+          platforms: linux/amd64,linux/arm64
       - name: reproducibility-test
         run: |
           make reproducibility-test
