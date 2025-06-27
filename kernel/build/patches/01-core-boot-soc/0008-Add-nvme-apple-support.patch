@@ -1,0 +1,293 @@
+From 7052931f862e174b5580c9f25755b459fa6a2c9a Mon Sep 17 00:00:00 2001
+From: Patch Generator <patches@example.com>
+Date: Fri, 27 Jun 2025 10:34:44 +0000
+Subject: [PATCH 08/12] Add nvme apple support
+
+Files modified:
+- drivers/nvme/host/apple.c
+- arch/arm64/boot/dts/apple/t602x-nvme.dtsi
+---
+ arch/arm64/boot/dts/apple/t602x-nvme.dtsi |  42 ++++++++
+ drivers/nvme/host/apple.c                 | 126 ++++++++++++++++++----
+ 2 files changed, 150 insertions(+), 18 deletions(-)
+ create mode 100644 arch/arm64/boot/dts/apple/t602x-nvme.dtsi
+
+diff --git a/arch/arm64/boot/dts/apple/t602x-nvme.dtsi b/arch/arm64/boot/dts/apple/t602x-nvme.dtsi
+new file mode 100644
+index 000000000..756a971bd
+--- /dev/null
++++ b/arch/arm64/boot/dts/apple/t602x-nvme.dtsi
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0+ OR MIT
++/*
++ * NVMe related devices for Apple T602x SoCs.
++ *
++ * Copyright The Asahi Linux Contributors
++ */
++
++	DIE_NODE(ans_mbox): mbox@347408000 {
++		compatible = "apple,t6020-asc-mailbox", "apple,asc-mailbox-v4";
++		reg = <0x3 0x47408000 0x0 0x4000>;
++		interrupt-parent = <&aic>;
++		interrupts = <AIC_IRQ DIE_NO 1169 IRQ_TYPE_LEVEL_HIGH>,
++			<AIC_IRQ DIE_NO 1170 IRQ_TYPE_LEVEL_HIGH>,
++			<AIC_IRQ DIE_NO 1171 IRQ_TYPE_LEVEL_HIGH>,
++			<AIC_IRQ DIE_NO 1172 IRQ_TYPE_LEVEL_HIGH>;
++		interrupt-names = "send-empty", "send-not-empty",
++			"recv-empty", "recv-not-empty";
++		power-domains = <&DIE_NODE(ps_ans2)>;
++		#mbox-cells = <0>;
++	};
++
++	DIE_NODE(sart): sart@34bc50000 {
++		compatible = "apple,t6020-sart", "apple,t6000-sart";
++		reg = <0x3 0x4bc50000 0x0 0x10000>;
++		power-domains = <&DIE_NODE(ps_ans2)>;
++	};
++
++	DIE_NODE(nvme): nvme@34bcc0000 {
++		compatible = "apple,t6020-nvme-ans2", "apple,nvme-ans2";
++		reg = <0x3 0x4bcc0000 0x0 0x40000>, <0x3 0x47400000 0x0 0x4000>;
++		reg-names = "nvme", "ans";
++		interrupt-parent = <&aic>;
++		/* The NVME interrupt is always routed to die 0 */
++		interrupts = <AIC_IRQ 0 1832 IRQ_TYPE_LEVEL_HIGH>;
++		mboxes = <&DIE_NODE(ans_mbox)>;
++		apple,sart = <&DIE_NODE(sart)>;
++		power-domains = <&DIE_NODE(ps_ans2)>,
++			<&DIE_NODE(ps_apcie_st_sys)>,
++			<&DIE_NODE(ps_apcie_st1_sys)>;
++		power-domain-names = "ans", "apcie0", "apcie1";
++		resets = <&DIE_NODE(ps_ans2)>;
++	};
+diff --git a/drivers/nvme/host/apple.c b/drivers/nvme/host/apple.c
+index b1387dc45..3065d6fcb 100644
+--- a/drivers/nvme/host/apple.c
++++ b/drivers/nvme/host/apple.c
+@@ -195,8 +195,20 @@ struct apple_nvme {
+ 
+ 	int irq;
+ 	spinlock_t lock;
++
++	/*
++	 * Delayed cache flush handling state
++	 */
++	struct nvme_ns *flush_ns;
++	unsigned long flush_interval;
++	unsigned long last_flush;
++	struct delayed_work flush_dwork;
+ };
+ 
++unsigned int flush_interval = 1000;
++module_param(flush_interval, uint, 0644);
++MODULE_PARM_DESC(flush_interval, "Grace period in msecs between flushes");
++
+ static_assert(sizeof(struct nvme_command) == 64);
+ static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
+ 
+@@ -221,7 +233,7 @@ static unsigned int apple_nvme_queue_depth(struct apple_nvme_queue *q)
+ 	return APPLE_ANS_MAX_QUEUE_DEPTH;
+ }
+ 
+-static void apple_nvme_rtkit_crashed(void *cookie)
++static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
+ {
+ 	struct apple_nvme *anv = cookie;
+ 
+@@ -729,6 +741,26 @@ static int apple_nvme_remove_sq(struct apple_nvme *anv)
+ 	return nvme_submit_sync_cmd(anv->ctrl.admin_q, &c, NULL, 0);
+ }
+ 
++static bool apple_nvme_delayed_flush(struct apple_nvme *anv, struct nvme_ns *ns,
++				     struct request *req)
++{
++	if (!anv->flush_interval || req_op(req) != REQ_OP_FLUSH)
++		return false;
++	if (delayed_work_pending(&anv->flush_dwork))
++		return true;
++	if (time_before(jiffies, anv->last_flush + anv->flush_interval)) {
++		kblockd_mod_delayed_work_on(WORK_CPU_UNBOUND, &anv->flush_dwork,
++						anv->flush_interval);
++		if (WARN_ON_ONCE(anv->flush_ns && anv->flush_ns != ns))
++			goto out;
++		anv->flush_ns = ns;
++		return true;
++	}
++out:
++	anv->last_flush = jiffies;
++	return false;
++}
++
+ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 					const struct blk_mq_queue_data *bd)
+ {
+@@ -764,6 +796,12 @@ static blk_status_t apple_nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	}
+ 
+ 	nvme_start_request(req);
++
++	if (apple_nvme_delayed_flush(anv, ns, req)) {
++		blk_mq_complete_request(req);
++		return BLK_STS_OK;
++	}
++
+ 	apple_nvme_submit_cmd(q, cmnd);
+ 	return BLK_STS_OK;
+ 
+@@ -1011,25 +1049,37 @@ static void apple_nvme_reset_work(struct work_struct *work)
+ 		ret = apple_rtkit_shutdown(anv->rtk);
+ 		if (ret)
+ 			goto out;
++
++		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+ 	}
+ 
+-	writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
++	/*
++	 * Only do the soft-reset if the CPU is not running, which means either we
++	 * or the previous stage shut it down cleanly.
++	 */
++	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
++		APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
+ 
+-	ret = reset_control_assert(anv->reset);
+-	if (ret)
+-		goto out;
++		ret = reset_control_assert(anv->reset);
++		if (ret)
++			goto out;
+ 
+-	ret = apple_rtkit_reinit(anv->rtk);
+-	if (ret)
+-		goto out;
++		ret = apple_rtkit_reinit(anv->rtk);
++		if (ret)
++			goto out;
+ 
+-	ret = reset_control_deassert(anv->reset);
+-	if (ret)
+-		goto out;
++		ret = reset_control_deassert(anv->reset);
++		if (ret)
++			goto out;
++
++		writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
++		       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
++
++		ret = apple_rtkit_boot(anv->rtk);
++	} else {
++		ret = apple_rtkit_wake(anv->rtk);
++	}
+ 
+-	writel(APPLE_ANS_COPROC_CPU_CONTROL_RUN,
+-	       anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
+-	ret = apple_rtkit_boot(anv->rtk);
+ 	if (ret) {
+ 		dev_err(anv->dev, "ANS did not boot");
+ 		goto out;
+@@ -1388,6 +1438,28 @@ static void devm_apple_nvme_mempool_destroy(void *data)
+ 	mempool_destroy(data);
+ }
+ 
++static void apple_nvme_flush_work(struct work_struct *work)
++{
++	struct nvme_command c = { };
++	struct apple_nvme *anv;
++	struct nvme_ns *ns;
++	int err;
++
++	anv = container_of(work, struct apple_nvme, flush_dwork.work);
++	ns = anv->flush_ns;
++	if (WARN_ON_ONCE(!ns))
++		return;
++
++	c.common.opcode = nvme_cmd_flush;
++	c.common.nsid = cpu_to_le32(anv->flush_ns->head->ns_id);
++	err = nvme_submit_sync_cmd(ns->queue, &c, NULL, 0);
++	if (err) {
++		dev_err(anv->dev, "Deferred flush failed: %d\n", err);
++	} else {
++		anv->last_flush = jiffies;
++	}
++}
++
+ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -1518,6 +1590,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
+ 
+ 	return anv;
+ put_dev:
++	apple_nvme_detach_genpd(anv);
+ 	put_device(anv->dev);
+ 	return ERR_PTR(ret);
+ }
+@@ -1542,6 +1615,14 @@ static int apple_nvme_probe(struct platform_device *pdev)
+ 		goto out_uninit_ctrl;
+ 	}
+ 
++	if (flush_interval) {
++		anv->flush_interval = msecs_to_jiffies(flush_interval);
++		anv->flush_ns = NULL;
++		anv->last_flush = jiffies - anv->flush_interval;
++	}
++
++	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
++
+ 	nvme_reset_ctrl(&anv->ctrl);
+ 	async_schedule(apple_nvme_async_probe, anv);
+ 
+@@ -1551,6 +1632,7 @@ static int apple_nvme_probe(struct platform_device *pdev)
+ 	nvme_uninit_ctrl(&anv->ctrl);
+ out_put_ctrl:
+ 	nvme_put_ctrl(&anv->ctrl);
++	apple_nvme_detach_genpd(anv);
+ 	return ret;
+ }
+ 
+@@ -1565,9 +1647,12 @@ static void apple_nvme_remove(struct platform_device *pdev)
+ 	apple_nvme_disable(anv, true);
+ 	nvme_uninit_ctrl(&anv->ctrl);
+ 
+-	if (apple_rtkit_is_running(anv->rtk))
++	if (apple_rtkit_is_running(anv->rtk)) {
+ 		apple_rtkit_shutdown(anv->rtk);
+ 
++		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
++	}
++
+ 	apple_nvme_detach_genpd(anv);
+ }
+ 
+@@ -1575,9 +1660,13 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
+ {
+ 	struct apple_nvme *anv = platform_get_drvdata(pdev);
+ 
++	flush_delayed_work(&anv->flush_dwork);
+ 	apple_nvme_disable(anv, true);
+-	if (apple_rtkit_is_running(anv->rtk))
++	if (apple_rtkit_is_running(anv->rtk)) {
+ 		apple_rtkit_shutdown(anv->rtk);
++
++		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
++	}
+ }
+ 
+ static int apple_nvme_resume(struct device *dev)
+@@ -1594,10 +1683,11 @@ static int apple_nvme_suspend(struct device *dev)
+ 
+ 	apple_nvme_disable(anv, true);
+ 
+-	if (apple_rtkit_is_running(anv->rtk))
++	if (apple_rtkit_is_running(anv->rtk)) {
+ 		ret = apple_rtkit_shutdown(anv->rtk);
+ 
+-	writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
++		writel(0, anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL);
++	}
+ 
+ 	return ret;
+ }
+-- 
+2.43.0
+

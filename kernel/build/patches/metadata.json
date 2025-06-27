@@ -1,0 +1,16 @@
+{
+    "generation_date": "2025-06-27T10:35:02Z",
+    "source_asahi_version": "asahi-6.12.12-1",
+    "source_upstream_version": "6.12.12",
+    "target_upstream_version": "6.12.31",
+    "target_updated": false,
+    "patches_against": "upstream 6.12.12",
+    "method": "directory-comparison",
+    "patch_count": {
+        "01-core-boot-soc": 5,
+        "02-peripherals": 5,
+        "03-graphics-display": 1,
+        "99-uncategorized": 1
+    },
+    "total_patches": 12
+}
